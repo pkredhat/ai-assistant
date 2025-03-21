@@ -1,161 +1,210 @@
-﻿using System;
+﻿using AiAssistant.Models;
+using DotNetEnv;
+using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
-using System.Collections.Concurrent;
 
-class Program
+namespace AiAssistant
 {
-    // Duration (in seconds) for each audio chunk.
-    const int ChunkDuration = 5;
-
-    // Path to the Whisper model.
-    const string ModelPath = "/Users/phknezev/code/whisper.cpp/models/ggml-base.en.bin";
-
-    // Persistent Ollama client instance
-    static OllamaClient _ollamaClient = new OllamaClient();
-
-    static async Task Main(string[] args)
+    class Program
     {
-        Console.WriteLine("Listening to your conversation..!");
-        // Total number of chunks to process (for demonstration)
-        const int totalChunks = 20;
-
-        // BlockingCollection to hold recorded chunk file names for processing
-        var chunkQueue = new BlockingCollection<string>();
-
-        // Producer Task: Records chunks and adds them to the queue
-        Task producer = Task.Run(async () =>
+        const int ChunkDuration = 10;        // Duration (in seconds) for each audio chunk.
+        const int totalChunks = 2;         // Total amount of chunks to produce
+        static readonly string ModelPath = Environment.GetEnvironmentVariable("MODEL_PATH");        // Path to the Whisper model.
+        static OllamaClient _ollamaClient = new OllamaClient();     // Persistent Ollama client instance
+        
+        static List<QuestionAnswer> Questions = new List<QuestionAnswer>();
+        
+        static async Task Main(string[] args)
         {
-            for (int i = 0; i < totalChunks; i++)
-            {
-                string chunkFile = $"chunk_{i:D3}.wav";
-                bool recorded = await RecordChunkAsync(chunkFile, ChunkDuration);
-                if (recorded)
-                {
-                    // Add the recorded chunk file to the queue
-                    chunkQueue.Add(chunkFile);
-                }
-                else
-                {
-                    Console.WriteLine($"Recording failed for {chunkFile}");
-                }
+            Env.Load(); // Load .env file
+            Console.WriteLine("Listening to your conversation..!");
+            
+            // BlockingCollection to hold recorded chunk file names for processing
+            var chunkQueue = new BlockingCollection<string>();
 
-                // Optional short delay for demonstration purposes
-                await Task.Delay(100);
+            // Producer Task: Records chunks and adds them to the queue
+            Task producer = StartProducerAsync(chunkQueue);
+
+            // Consumer Tasks: Process/transcribe the recorded chunks concurrently
+            List<Task> consumerTasks = StartConsumerTasks(chunkQueue);
+
+            // Wait for both the producer and all consumer tasks to complete
+            await producer;
+            await Task.WhenAll(consumerTasks);
+
+            Console.WriteLine("All chunks have been recorded and transcribed.");
+
+            Console.WriteLine("\n📝 Questions List:");
+            foreach (var question in Questions)
+            {
+                Console.WriteLine("👉 " + question.Question);
+                Console.WriteLine("💬 " + question.Answer + "\n\n");
             }
-            // Signal that no more items will be added
-            chunkQueue.CompleteAdding();
-        });
+        }
 
-        // Consumer Tasks: Process/transcribe the recorded chunks concurrently
-        int consumerCount = 2; // Adjust the number of consumers as needed
-        List<Task> consumerTasks = new List<Task>();
-        for (int c = 0; c < consumerCount; c++)
+        static List<Task> StartConsumerTasks(BlockingCollection<string> chunkQueue, int consumerCount = 2)
         {
-            consumerTasks.Add(Task.Run(async () =>
+            List<Task> consumerTasks = new List<Task>();
+            for (int c = 0; c < consumerCount; c++)
             {
-                // Process each chunk as it becomes available
-                foreach (var chunkFile in chunkQueue.GetConsumingEnumerable())
+                consumerTasks.Add(Task.Run(async () =>
                 {
-                    // The chunk number is not critical here; passing -1 or you could parse from the filename if needed
-                    await ProcessChunkAsync(chunkFile, -1);
+                    foreach (var chunkFile in chunkQueue.GetConsumingEnumerable())
+                    {
+                        await ProcessChunkAsync(chunkFile, -1);
+                    }
+                }));
+            }
+            return consumerTasks;
+        }
+
+        static Task StartProducerAsync(BlockingCollection<string> chunkQueue)
+        {
+            return Task.Run(async () =>
+            {
+                for (int i = 0; i < totalChunks; i++)
+                {
+                    string chunkFile = $"chunk_{i:D3}.wav";
+                    bool recorded = await RecordChunkAsync(chunkFile, ChunkDuration);
+                    if (recorded)
+                    {
+                        // Add the recorded chunk file to the queue
+                        chunkQueue.Add(chunkFile);
+                    }
+                    else
+                    {
+                        Console.WriteLine($"Recording failed for {chunkFile}");
+                    }
+
+                    // Optional short delay for demonstration purposes
+                    await Task.Delay(100);
                 }
-            }));
+                // Signal that no more items will be added
+                chunkQueue.CompleteAdding();
+            });
         }
 
-        // Wait for both the producer and all consumer tasks to complete
-        await producer;
-        await Task.WhenAll(consumerTasks);
-
-        Console.WriteLine("All chunks have been recorded and transcribed.");
-    }
-
-    // Records an audio chunk using FFmpeg.
-    static async Task<bool> RecordChunkAsync(string outputFile, int durationSeconds)
-    {
-        var ffmpeg = new Process
+        // Records an audio chunk using FFmpeg.
+        static async Task<bool> RecordChunkAsync(string outputFile, int durationSeconds)
         {
-            StartInfo = new ProcessStartInfo
+            var ffmpeg = new Process
             {
-                FileName = "ffmpeg",
-                Arguments = $"-f avfoundation -i \"none:0\" -t {durationSeconds} -y {outputFile}",
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            }
-        };
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = "ffmpeg",
+                    Arguments = $"-f avfoundation -i \"none:0\" -t {durationSeconds} -y {outputFile}",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                }
+            };
 
-        ffmpeg.Start();
+            ffmpeg.Start();
 
-        // We'll read ffmpeg's error stream to let it run to completion
-        await ffmpeg.StandardError.ReadToEndAsync();
-        ffmpeg.WaitForExit();
+            // We'll read ffmpeg's error stream to let it run to completion
+            await ffmpeg.StandardError.ReadToEndAsync();
+            ffmpeg.WaitForExit();
 
-        // Return true if the file was created
-        return File.Exists(outputFile);
-    }
+            // Return true if the file was created
+            return File.Exists(outputFile);
+        }
 
-    // Transcribes a chunk using whisper-cli, then extracts and processes questions.
-    static async Task ProcessChunkAsync(string chunkFile, int chunkNumber)
-    {
-        var whisper = new Process
+        static async Task ProcessChunkAsync(string chunkFile, int chunkNumber)
         {
-            StartInfo = new ProcessStartInfo
+            var whisperCliPath = Environment.GetEnvironmentVariable("WHISPER_CLI") ?? "whisper-cli";
+            var whisper = new Process
             {
-                FileName = "whisper-cli",
-                Arguments = $"{chunkFile} --model {ModelPath}",
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = whisperCliPath,
+                    Arguments = $"{chunkFile} --model {ModelPath}",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                }
+            };
+
+            whisper.Start();
+            string transcribed = await whisper.StandardOutput.ReadToEndAsync();
+            string source = $"{chunkFile} @ {DateTime.Now:yyyy-MM-dd HH:mm:ss}";
+            whisper.WaitForExit();
+ 
+            // Extract Questions from Audio
+            await ExtractQuestionsAsync(transcribed, source);
+
+            // Clean up the chunk file
+            try {
+                File.Delete(chunkFile);
             }
-        };
-
-        whisper.Start();
-        string output = await whisper.StandardOutput.ReadToEndAsync();
-        whisper.WaitForExit();
-
-        // Now that we have the transcription, find questions and handle them
-        await ExtractQuestionsAsync(output);
-
-        // Clean up the chunk file
-        try
-        {
-            File.Delete(chunkFile);
+            catch (Exception ex) {
+                Console.WriteLine($"Failed to delete file {chunkFile}: {ex.Message}");
+            }
         }
-        catch (Exception ex)
+
+        static async Task ExtractQuestionsAsync(string transcription, string source)
         {
-            Console.WriteLine($"Failed to delete file {chunkFile}: {ex.Message}");
+            using var client = new HttpClient();
+            var requestBody = new
+            {
+                text = transcription
+            };
+            var json = JsonSerializer.Serialize(requestBody);
+            var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+            try
+            {
+                var apiUrl = Environment.GetEnvironmentVariable("API_URL");
+                if (string.IsNullOrWhiteSpace(apiUrl)) {
+                    throw new InvalidOperationException("API_URL is not defined in the environment or .env file.");
+                }
+
+                var response = await client.PostAsync(apiUrl, content);
+                response.EnsureSuccessStatusCode();
+                string responseJson = await response.Content.ReadAsStringAsync();
+
+                // we need to parse the results for timestampts
+                var parsed = JsonSerializer.Deserialize<Dictionary<string, List<string>>>(responseJson);
+                if (parsed != null && parsed.ContainsKey("questions"))
+                {
+                    foreach (var q in parsed["questions"])
+                    {
+                        string cleanQuestion = RemoveTimestampPrefix(q).Replace("\n", " ").Trim();
+                        string answeredQuestion = await SendQuestionToOllama(cleanQuestion);
+                        QuestionAnswer qa = new QuestionAnswer(cleanQuestion, answeredQuestion, "", 0f, source);
+                        Questions.Add(qa);
+                    }
+                }
+            }
+            catch (HttpRequestException ex)
+            {
+                Console.WriteLine($"❌ Error: {ex.Message}");
+                throw new HttpRequestException();
+            }
         }
-    }
 
-    // Extracts questions from the transcription, then calls Ollama for each one.
-    static async Task ExtractQuestionsAsync(string transcription)
-    {
-        const string pattern = @"\b(Who|What|Where|When|Why|How|Is|Can|Do)\b.*\?";
-        var matches = Regex.Matches(transcription, pattern, RegexOptions.IgnoreCase);
-
-        foreach (Match match in matches)
+        static async Task<string> SendQuestionToOllama(string question)
         {
-            // Found a question
-            string question = match.Value;
-            //Console.WriteLine(question);
-            // Send to Ollama
-            string answer = await SendQuestionToOllama(question);
+            string answer = await _ollamaClient.SendQuestionAsync(question);
+            //Console.WriteLine("Received answer: " + answer);
+            //Console.WriteLine("----------------------------------");
+            return answer;
         }
-    }
 
-
-    // Sends the question using the persistent process
-    static async Task<string> SendQuestionToOllama(string question)
-    {
-        string answer = await _ollamaClient.SendQuestionAsync(question);
-        Console.WriteLine("Received answer: " + answer);
-        Console.WriteLine("----------------------------------");
-        return answer;
+        // ✅ Helper method to remove timestamps like [00:00:00.000 --> 00:00:01.360]
+        static string RemoveTimestampPrefix(string text)
+        {
+            return Regex.Replace(text, @"^\[\d{2}:\d{2}:\d{2}\.\d{3}( --> \d{2}:\d{2}:\d{2}\.\d{3})?\]\s*", "");
+        }
     }
 }
