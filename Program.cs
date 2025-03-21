@@ -10,6 +10,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace AiAssistant
@@ -26,13 +27,20 @@ namespace AiAssistant
         static async Task Main(string[] args)
         {
             Env.Load(); // Load .env file
+            var cts = new CancellationTokenSource();
+            Console.CancelKeyPress += (sender, e) =>
+            {
+                e.Cancel = true;
+                Console.WriteLine("⛔ Graceful shutdown requested...");
+                cts.Cancel();
+            };
             Console.WriteLine("Listening to your conversation..!");
             
             // BlockingCollection to hold recorded chunk file names for processing
             var chunkQueue = new BlockingCollection<string>();
 
             // Producer Task: Records chunks and adds them to the queue
-            Task producer = StartProducerAsync(chunkQueue);
+            Task producer = StartProducerAsync(chunkQueue, cts.Token);
 
             // Consumer Tasks: Process/transcribe the recorded chunks concurrently
             List<Task> consumerTasks = StartConsumerTasks(chunkQueue);
@@ -67,29 +75,39 @@ namespace AiAssistant
             return consumerTasks;
         }
 
-        static Task StartProducerAsync(BlockingCollection<string> chunkQueue)
+        static Task StartProducerAsync(BlockingCollection<string> chunkQueue, CancellationToken cancellationToken)
         {
             return Task.Run(async () =>
             {
-                for (int i = 0; i < totalChunks; i++)
+                try
                 {
-                    string chunkFile = $"chunk_{i:D3}.wav";
-                    bool recorded = await RecordChunkAsync(chunkFile, ChunkDuration);
-                    if (recorded)
+                    for (int i = 0; i < totalChunks && !cancellationToken.IsCancellationRequested; i++)
                     {
-                        // Add the recorded chunk file to the queue
-                        chunkQueue.Add(chunkFile);
-                    }
-                    else
-                    {
-                        Console.WriteLine($"Recording failed for {chunkFile}");
-                    }
+                        string chunkFile = $"chunk_{i:D3}.wav";
+                        bool recorded = await RecordChunkAsync(chunkFile, ChunkDuration);
+                        if (recorded)
+                        {
+                            // Add the recorded chunk file to the queue
+                            chunkQueue.Add(chunkFile);
+                        }
+                        else
+                        {
+                            Console.WriteLine($"Recording failed for {chunkFile}");
+                        }
 
-                    // Optional short delay for demonstration purposes
-                    await Task.Delay(100);
+                        // Optional short delay for demonstration purposes
+                        await Task.Delay(100, cancellationToken);
+                    }
                 }
-                // Signal that no more items will be added
-                chunkQueue.CompleteAdding();
+                catch (TaskCanceledException)
+                {
+                    Console.WriteLine("✅ Producer cancelled gracefully.");
+                }
+                finally
+                {
+                    // Signal that no more items will be added
+                    chunkQueue.CompleteAdding();
+                }
             });
         }
 
@@ -162,34 +180,47 @@ namespace AiAssistant
             var json = JsonSerializer.Serialize(requestBody);
             var content = new StringContent(json, Encoding.UTF8, "application/json");
 
-            try
+            int maxRetries = 3;
+            int delayMilliseconds = 1000;
+
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
             {
-                var apiUrl = Environment.GetEnvironmentVariable("API_URL");
-                if (string.IsNullOrWhiteSpace(apiUrl)) {
-                    throw new InvalidOperationException("API_URL is not defined in the environment or .env file.");
-                }
-
-                var response = await client.PostAsync(apiUrl, content);
-                response.EnsureSuccessStatusCode();
-                string responseJson = await response.Content.ReadAsStringAsync();
-
-                // we need to parse the results for timestampts
-                var parsed = JsonSerializer.Deserialize<Dictionary<string, List<string>>>(responseJson);
-                if (parsed != null && parsed.ContainsKey("questions"))
+                try
                 {
-                    foreach (var q in parsed["questions"])
-                    {
-                        string cleanQuestion = RemoveTimestampPrefix(q).Replace("\n", " ").Trim();
-                        string answeredQuestion = await SendQuestionToOllama(cleanQuestion);
-                        QuestionAnswer qa = new QuestionAnswer(cleanQuestion, answeredQuestion, "", 0f, source);
-                        Questions.Add(qa);
+                    var apiUrl = Environment.GetEnvironmentVariable("API_URL");
+                    if (string.IsNullOrWhiteSpace(apiUrl)) {
+                        throw new InvalidOperationException("API_URL is not defined in the environment or .env file.");
                     }
+
+                    var response = await client.PostAsync(apiUrl, content);
+                    response.EnsureSuccessStatusCode();
+                    string responseJson = await response.Content.ReadAsStringAsync();
+
+                    var parsed = JsonSerializer.Deserialize<Dictionary<string, List<string>>>(responseJson);
+                    if (parsed != null && parsed.ContainsKey("questions"))
+                    {
+                        foreach (var q in parsed["questions"])
+                        {
+                            string cleanQuestion = RemoveTimestampPrefix(q).Replace("\n", " ").Trim();
+                            string answeredQuestion = await SendQuestionToOllama(cleanQuestion);
+                            QuestionAnswer qa = new QuestionAnswer(cleanQuestion, answeredQuestion, "", 0f, source);
+                            Questions.Add(qa);
+                        }
+                    }
+
+                    break; // Exit loop if successful
                 }
-            }
-            catch (HttpRequestException ex)
-            {
-                Console.WriteLine($"❌ Error: {ex.Message}");
-                throw new HttpRequestException();
+                catch (HttpRequestException ex)
+                {
+                    Console.WriteLine($"❌ API attempt {attempt} failed: {ex.Message}");
+                    if (attempt == maxRetries)
+                    {
+                        Console.WriteLine("⚠️ Max retry attempts reached. Skipping this chunk.");
+                        break;
+                    }
+                    await Task.Delay(delayMilliseconds);
+                    delayMilliseconds *= 2; // Exponential backoff
+                }
             }
         }
 
